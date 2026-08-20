@@ -1,2 +1,3 @@
 # codecks-mcp
-And MCP service for access to codeck's API
+
+A MCP service for access to codeck's API
