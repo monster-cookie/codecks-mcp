@@ -2,14 +2,16 @@
 //!
 //! This module isolates Codecks authentication, requests, and responses from MCP protocol handling.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use crate::config::Config;
+use crate::domain::Project;
 use crate::error::ApplicationError;
 
 /// The fixed public endpoint used for Codecks API requests.
@@ -17,6 +19,7 @@ pub const CODECKS_API_ENDPOINT: &str = "https://api.codecks.io/";
 
 const ACCOUNT_HEADER: HeaderName = HeaderName::from_static("x-account");
 const AUTHENTICATION_HEADER: HeaderName = HeaderName::from_static("x-auth-token");
+const PROJECT_PAGE_SIZE: usize = 100;
 
 /// An asynchronous, credential-safe client for the Codecks JSON API.
 ///
@@ -97,6 +100,53 @@ impl CodecksClient {
 
         response.json().await.map_err(map_response_error)
     }
+
+    /// Retrieves every active project available to the authenticated Codecks account.
+    ///
+    /// Results retain the stable Codecks UUID and the current display name. The API is queried in
+    /// deterministic pages until it returns fewer projects than the requested page size.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed transport errors documented by [`Self::request`], or
+    /// [`ApplicationError::InvalidCodecksResponse`] when a response does not contain a valid
+    /// normalized Codecks project page.
+    pub async fn list_projects(&self) -> Result<Vec<Project>, ApplicationError> {
+        self.list_projects_with_page_size(PROJECT_PAGE_SIZE).await
+    }
+
+    async fn list_projects_with_page_size(
+        &self,
+        page_size: usize,
+    ) -> Result<Vec<Project>, ApplicationError> {
+        debug_assert!(page_size > 0, "the project page size must be positive");
+
+        let mut offset = 0;
+        let mut projects = Vec::new();
+        let mut project_uuids = HashSet::new();
+
+        loop {
+            let request = project_page_request(page_size, offset);
+            let response = self.request(&request).await?;
+            let page = parse_project_page(&response)?;
+            let page_length = page.len();
+
+            for project in page {
+                if !project_uuids.insert(project.uuid().to_owned()) {
+                    return Err(ApplicationError::InvalidCodecksResponse);
+                }
+                projects.push(project);
+            }
+
+            if page_length < page_size {
+                return Ok(projects);
+            }
+
+            offset = offset
+                .checked_add(page_size)
+                .ok_or(ApplicationError::InvalidCodecksResponse)?;
+        }
+    }
 }
 
 impl fmt::Debug for CodecksClient {
@@ -138,15 +188,109 @@ fn map_response_error(error: reqwest::Error) -> ApplicationError {
     }
 }
 
+fn project_page_request(page_size: usize, offset: usize) -> Value {
+    let mut project_selection = Map::new();
+    project_selection.insert(
+        project_relation_key(page_size, offset),
+        json!(["id", "name"]),
+    );
+
+    json!({
+        "query": {
+            "_root": [{
+                "account": [project_selection]
+            }]
+        }
+    })
+}
+
+fn project_relation_key(page_size: usize, offset: usize) -> String {
+    let pagination = json!({
+        "$order": "id",
+        "$limit": page_size,
+        "$offset": offset,
+    });
+    format!("projects({pagination})")
+}
+
+fn parse_project_page(response: &Value) -> Result<Vec<Project>, ApplicationError> {
+    let root = response
+        .get("_root")
+        .and_then(|root| {
+            root.as_array()
+                .and_then(|entries| entries.first())
+                .or(Some(root))
+        })
+        .and_then(Value::as_object)
+        .ok_or(ApplicationError::InvalidCodecksResponse)?;
+    let account_reference =
+        relation_value(root, "account").ok_or(ApplicationError::InvalidCodecksResponse)?;
+    let account = resolve_entity(response, "account", account_reference)?;
+    let project_references = relation_value(account, "projects")
+        .and_then(Value::as_array)
+        .ok_or(ApplicationError::InvalidCodecksResponse)?;
+
+    project_references
+        .iter()
+        .map(|project_reference| {
+            let project_entity = resolve_entity(response, "project", project_reference)?;
+            let project = serde_json::from_value::<Project>(Value::Object(project_entity.clone()))
+                .map_err(|_| ApplicationError::InvalidCodecksResponse)?;
+
+            if let Some(project_uuid) = project_reference.as_str()
+                && project.uuid() != project_uuid
+            {
+                return Err(ApplicationError::InvalidCodecksResponse);
+            }
+
+            Ok(project)
+        })
+        .collect()
+}
+
+fn relation_value<'a>(entity: &'a Map<String, Value>, relation: &str) -> Option<&'a Value> {
+    entity.get(relation).or_else(|| {
+        let queried_relation_prefix = format!("{relation}(");
+        entity
+            .iter()
+            .find_map(|(key, value)| key.starts_with(&queried_relation_prefix).then_some(value))
+    })
+}
+
+fn resolve_entity<'a>(
+    response: &'a Value,
+    model: &str,
+    reference: &'a Value,
+) -> Result<&'a Map<String, Value>, ApplicationError> {
+    if let Some(entity) = reference.as_object() {
+        return Ok(entity);
+    }
+
+    let entity_id = reference
+        .as_str()
+        .ok_or(ApplicationError::InvalidCodecksResponse)?;
+    response
+        .get(model)
+        .and_then(Value::as_object)
+        .and_then(|entities| entities.get(entity_id))
+        .and_then(Value::as_object)
+        .ok_or(ApplicationError::InvalidCodecksResponse)
+}
+
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod support;
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::Duration;
 
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     use super::support::{DisconnectingServer, MockResponse, MockServer};
@@ -155,6 +299,49 @@ mod tests {
     const TEST_ACCOUNT: &str = "client-test-account";
     const TEST_TOKEN: &str = "client-secret-sentinel";
 
+    struct ProjectPageServer {
+        endpoint: String,
+        request_receiver: Option<oneshot::Receiver<Vec<Vec<u8>>>>,
+        task: JoinHandle<io::Result<()>>,
+    }
+
+    impl ProjectPageServer {
+        async fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the project mock server should bind to a loopback port");
+            let address = listener
+                .local_addr()
+                .expect("the project mock server should expose its loopback address");
+            let (request_sender, request_receiver) = oneshot::channel();
+            let task = tokio::spawn(serve_project_pages(listener, responses, request_sender));
+
+            Self {
+                endpoint: format!("http://{address}/"),
+                request_receiver: Some(request_receiver),
+                task,
+            }
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        async fn received_requests(&mut self) -> Vec<Vec<u8>> {
+            self.request_receiver
+                .take()
+                .expect("the project requests should only be read once")
+                .await
+                .expect("the project mock server should capture its requests")
+        }
+    }
+
+    impl Drop for ProjectPageServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     fn config(timeout_seconds: &str) -> Config {
         Config::from_values([
             ("CODECKS_ACCOUNT", TEST_ACCOUNT),
@@ -162,6 +349,50 @@ mod tests {
             ("CODECKS_TIMEOUT_SECONDS", timeout_seconds),
         ])
         .expect("the client test configuration should be valid")
+    }
+
+    fn project_page_response(page_size: usize, offset: usize, projects: &[(&str, &str)]) -> String {
+        let project_ids = projects
+            .iter()
+            .map(|(project_id, _)| Value::String((*project_id).to_owned()))
+            .collect();
+        let mut account = Map::new();
+        account.insert(
+            project_relation_key(page_size, offset),
+            Value::Array(project_ids),
+        );
+        let project_entities = projects
+            .iter()
+            .map(|(project_id, name)| {
+                (
+                    (*project_id).to_owned(),
+                    json!({"id": project_id, "name": name}),
+                )
+            })
+            .collect::<Map<_, _>>();
+
+        json!({
+            "_root": [{"account": "account-id"}],
+            "account": {"account-id": account},
+            "project": project_entities,
+        })
+        .to_string()
+    }
+
+    fn requested_project_relation(request: &[u8]) -> String {
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("the captured request should contain HTTP headers")
+            + 4;
+        let body: Value = serde_json::from_slice(&request[body_start..])
+            .expect("the captured request body should be JSON");
+
+        body["query"]["_root"][0]["account"][0]
+            .as_object()
+            .and_then(|selection| selection.keys().next())
+            .cloned()
+            .expect("the request should select the projects relation")
     }
 
     #[tokio::test]
@@ -277,5 +508,145 @@ mod tests {
             .is_err(),
             "the redirect target unexpectedly received a request"
         );
+    }
+
+    #[tokio::test]
+    async fn lists_zero_projects_from_a_mocked_api_page() {
+        let mut server = ProjectPageServer::start(vec![project_page_response(2, 0, &[])]).await;
+        let client = CodecksClient::with_endpoint(&config("30"), server.endpoint())
+            .expect("the project test client should build");
+
+        let projects = client
+            .list_projects_with_page_size(2)
+            .await
+            .expect("an empty project page should succeed");
+        let requests = server.received_requests().await;
+
+        assert!(projects.is_empty());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requested_project_relation(&requests[0]),
+            project_relation_key(2, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_one_project_from_a_mocked_api_page() {
+        let server = ProjectPageServer::start(vec![project_page_response(
+            2,
+            0,
+            &[("project-uuid", "Project Display Name")],
+        )])
+        .await;
+        let client = CodecksClient::with_endpoint(&config("30"), server.endpoint())
+            .expect("the project test client should build");
+
+        let projects = client
+            .list_projects_with_page_size(2)
+            .await
+            .expect("a single project page should succeed");
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].uuid(), "project-uuid");
+        assert_eq!(projects[0].name(), "Project Display Name");
+    }
+
+    #[tokio::test]
+    async fn retrieves_multiple_project_pages_from_a_mocked_api() {
+        let mut server = ProjectPageServer::start(vec![
+            project_page_response(
+                2,
+                0,
+                &[("project-a", "Project A"), ("project-b", "Project B")],
+            ),
+            project_page_response(2, 2, &[("project-c", "Project C")]),
+        ])
+        .await;
+        let client = CodecksClient::with_endpoint(&config("30"), server.endpoint())
+            .expect("the project test client should build");
+
+        let projects = client
+            .list_projects_with_page_size(2)
+            .await
+            .expect("all project pages should succeed");
+        let requests = server.received_requests().await;
+
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| (project.uuid(), project.name()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("project-a", "Project A"),
+                ("project-b", "Project B"),
+                ("project-c", "Project C"),
+            ]
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requested_project_relation(&requests[0]),
+            project_relation_key(2, 0)
+        );
+        assert_eq!(
+            requested_project_relation(&requests[1]),
+            project_relation_key(2, 2)
+        );
+    }
+
+    async fn serve_project_pages(
+        listener: TcpListener,
+        responses: Vec<String>,
+        request_sender: oneshot::Sender<Vec<Vec<u8>>>,
+    ) -> io::Result<()> {
+        let mut requests = Vec::with_capacity(responses.len());
+
+        for response in responses {
+            let (mut stream, _) = listener.accept().await?;
+            requests.push(read_project_request(&mut stream).await?);
+            let message = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            stream.write_all(message.as_bytes()).await?;
+            stream.shutdown().await?;
+        }
+
+        let _ = request_sender.send(requests);
+        Ok(())
+    }
+
+    async fn read_project_request(stream: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+
+        loop {
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+
+            let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let body_start = headers_end + 4;
+            let headers = String::from_utf8_lossy(&request[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or_default();
+
+            if request.len() >= body_start + content_length {
+                return Ok(request);
+            }
+        }
+
+        Ok(request)
     }
 }
