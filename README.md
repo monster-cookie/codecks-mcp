@@ -3,8 +3,8 @@
 An independent Model Context Protocol (MCP) server for the Codecks API.
 
 > [!NOTE]
-> The repository currently contains the initial Rust workspace and module boundaries. It does
-> not yet implement the MCP protocol or communicate with Codecks.
+> The repository currently contains the Rust workspace, validated runtime configuration, and core
+> error model. It does not yet implement the MCP protocol or communicate with Codecks.
 
 ## Development
 
@@ -24,11 +24,18 @@ components automatically through Rustup.
 
 - `src/main.rs` is the executable entry point.
 - `src/lib.rs` exposes the library's architectural boundaries.
-- `src/mcp.rs` is reserved for MCP transport and protocol integration.
+- `src/mcp.rs` defines MCP-facing representations and is reserved for transport integration.
 - `src/codecks_api.rs` is reserved for Codecks API integration.
 - `src/config.rs` is reserved for configuration loading and validation.
 - `src/domain.rs` is reserved for domain models shared across integrations.
-- `src/error.rs` is reserved for application error types and reporting.
+- `src/error.rs` defines application error types shared by the API and MCP layers.
+
+### Error model
+
+Core failures use typed application errors with stable machine-readable codes and credential-safe
+messages. Every application error converts into a structured MCP-facing error. These types do not
+retain raw credentials, request headers, response bodies, or upstream error text, so standard debug
+and display formatting cannot expose those values.
 
 ### Build and verify
 
