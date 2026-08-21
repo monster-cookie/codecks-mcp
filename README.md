@@ -4,8 +4,8 @@ An independent Model Context Protocol (MCP) server for the Codecks API.
 
 > [!NOTE]
 > The repository currently contains the Rust workspace, validated runtime configuration, core
-> error model, and asynchronous Codecks HTTP client. It does not yet implement the MCP protocol or
-> expose Codecks operations.
+> error model, asynchronous Codecks HTTP client, and paginated project discovery. It does not yet
+> implement the MCP protocol or expose project discovery as an MCP operation.
 
 ## Development
 
@@ -26,9 +26,10 @@ components automatically through Rustup.
 - `src/main.rs` is the executable entry point.
 - `src/lib.rs` exposes the library's architectural boundaries.
 - `src/mcp.rs` defines MCP-facing representations and is reserved for transport integration.
-- `src/codecks_api.rs` provides authenticated, timeout-bounded Codecks API transport.
+- `src/codecks_api.rs` provides authenticated, timeout-bounded Codecks API transport and project
+  enumeration.
 - `src/config.rs` is reserved for configuration loading and validation.
-- `src/domain.rs` is reserved for domain models shared across integrations.
+- `src/domain.rs` defines project models shared across integrations.
 - `src/error.rs` defines application error types shared by the API and MCP layers.
 
 ### Error model
@@ -76,3 +77,11 @@ request duration are bounded by `CODECKS_TIMEOUT_SECONDS`. HTTP status, timeout,
 decoding failures map to credential-safe application errors; response bodies and upstream error
 details are not retained in diagnostics. Redirects are rejected so authentication headers cannot
 leave the fixed Codecks endpoint.
+
+## Project discovery
+
+`CodecksClient::list_projects` retrieves every active project visible to the authenticated account.
+It requests projects in stable, ordered pages and continues until Codecks returns a partial page.
+Each result preserves the stable project UUID and the exact current display name returned by the
+API. Mock transport coverage verifies empty, single-project, and multi-page responses without using
+live Codecks credentials.
