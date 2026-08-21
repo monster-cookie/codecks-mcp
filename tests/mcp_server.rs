@@ -246,6 +246,79 @@ fn executable_exits_when_the_client_stops_reading_standard_output() {
 }
 
 #[test]
+fn executable_exits_when_standard_output_closes_while_standard_input_remains_open() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codecks-mcp"))
+        .env("CODECKS_ACCOUNT", "closed-output-test-account")
+        .env("CODECKS_TOKEN", "closed-output-test-token")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the Codecks MCP executable should start");
+    let mut input = child
+        .stdin
+        .take()
+        .expect("the child standard input should be piped");
+    let output = child
+        .stdout
+        .take()
+        .expect("the child standard output should be piped");
+    drop(output);
+
+    writeln!(
+        input,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": modern_params(),
+        })
+    )
+    .expect("the closed-output probe request should be written");
+    input
+        .flush()
+        .expect("the closed-output probe request should be flushed");
+
+    let exit_deadline = Instant::now() + OUTPUT_BACKPRESSURE_EXIT_DEADLINE;
+    let exited_promptly = loop {
+        if child
+            .try_wait()
+            .expect("the closed-output probe state should be readable")
+            .is_some()
+        {
+            break true;
+        }
+        if Instant::now() >= exit_deadline {
+            child
+                .kill()
+                .expect("the unresponsive closed-output probe should be stopped");
+            break false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    drop(input);
+    let output = child
+        .wait_with_output()
+        .expect("the closed-output probe output should be collected");
+    let stderr = String::from_utf8(output.stderr)
+        .expect("the closed-output probe standard error should be UTF-8");
+
+    assert!(
+        exited_promptly,
+        "the MCP server waited for standard-input EOF after standard output closed: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "a closed standard-output pipe should terminate with a transport failure"
+    );
+    assert!(
+        stderr.contains("MCP transport error:"),
+        "unexpected closed-output failure: {stderr}"
+    );
+}
+
+#[test]
 fn executable_preserves_every_response_for_a_slow_buffered_reader() {
     assert_delayed_reader_burst(300, Duration::ZERO, Duration::from_millis(40));
 }

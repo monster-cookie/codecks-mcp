@@ -3,13 +3,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::task::{Context, Poll, Waker};
 
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, stdin};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{Duration, timeout};
@@ -21,6 +23,8 @@ pub(super) const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 const INPUT_CHANNEL_CAPACITY: usize = 64;
 const INPUT_BACKLOG_CAPACITY: usize = 4096;
 const INPUT_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+const STDIN_QUEUE_CAPACITY: usize = 8;
+const STDIN_CHUNK_BYTES: usize = 8 * 1024;
 pub(super) const RESPONSE_QUEUE_CAPACITY: usize = 64;
 const STDOUT_QUEUE_CAPACITY: usize = 8;
 const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
@@ -39,7 +43,12 @@ const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 /// Returns an I/O error when standard input cannot be read, bounded input backlog limits are
 /// exceeded, or a response cannot be written.
 pub async fn run_stdio(server: McpServer) -> io::Result<()> {
-    serve(server, BufReader::new(stdin()), BoundedStdout::new()?).await
+    serve(
+        server,
+        BufReader::new(ThreadedStdin::new()?),
+        BoundedStdout::new()?,
+    )
+    .await
 }
 
 pub(super) async fn serve<R, W>(mut server: McpServer, reader: R, writer: W) -> io::Result<()>
@@ -52,13 +61,38 @@ where
     let mut deferred_inputs = VecDeque::new();
     let (response_sender, response_receiver) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let mut writer_task = tokio::spawn(write_responses(writer, response_receiver));
-    let (completion_sender, mut completion_receiver) = mpsc::channel(MAX_IN_FLIGHT_REQUESTS);
+    let (completion_sender, mut completion_receiver) =
+        mpsc::channel::<CompletedRequest>(MAX_IN_FLIGHT_REQUESTS);
     let mut in_flight = HashMap::<RequestKey, InFlightRequest>::new();
     let mut next_task_token = 0_u64;
 
     let loop_result = loop {
         tokio::select! {
             biased;
+            Some(completed) = completion_receiver.recv() => {
+                let is_current = in_flight
+                    .get(&completed.key)
+                    .is_some_and(|request| request.token == completed.token);
+                if is_current {
+                    in_flight.remove(&completed.key);
+                    if let Some(response) = completed.response {
+                        match queue_response(
+                            &response_sender,
+                            response,
+                            &mut input_receiver,
+                            &mut deferred_inputs,
+                            &mut in_flight,
+                            &mut reader_task,
+                        )
+                        .await
+                        {
+                            Ok(QueueOutcome::Queued) => {}
+                            Ok(QueueOutcome::Stop) => break Ok(()),
+                            Err(error) => break Err(error),
+                        }
+                    }
+                }
+            }
             input = receive_input(&mut deferred_inputs, &mut input_receiver) => {
                 let Some(input) = input else {
                     break flatten_task_result((&mut reader_task).await);
@@ -173,30 +207,6 @@ where
                         }
                     }
                     FrameRead::EndOfFile => unreachable!("EOF is reported by the reader task"),
-                }
-            }
-            Some(completed) = completion_receiver.recv() => {
-                let is_current = in_flight
-                    .get(&completed.key)
-                    .is_some_and(|request| request.token == completed.token);
-                if is_current {
-                    in_flight.remove(&completed.key);
-                    if let Some(response) = completed.response {
-                        match queue_response(
-                            &response_sender,
-                            response,
-                            &mut input_receiver,
-                            &mut deferred_inputs,
-                            &mut in_flight,
-                            &mut reader_task,
-                        )
-                        .await
-                        {
-                            Ok(QueueOutcome::Queued) => {}
-                            Ok(QueueOutcome::Stop) => break Ok(()),
-                            Err(error) => break Err(error),
-                        }
-                    }
                 }
             }
             reader_result = &mut reader_task => {
@@ -500,10 +510,84 @@ struct CompletedRequest {
     response: Option<Value>,
 }
 
+struct StdoutChunk {
+    bytes: Vec<u8>,
+    flush_sender: oneshot::Sender<()>,
+}
+
+struct ThreadedStdin {
+    chunk_receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    current_chunk: Vec<u8>,
+    current_offset: usize,
+}
+
+impl ThreadedStdin {
+    fn new() -> io::Result<Self> {
+        let (chunk_sender, chunk_receiver) = mpsc::channel(STDIN_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("codecks-mcp-stdin".to_owned())
+            .spawn(move || read_stdin_chunks(&chunk_sender))?;
+
+        Ok(Self {
+            chunk_receiver,
+            current_chunk: Vec::new(),
+            current_offset: 0,
+        })
+    }
+}
+
+impl AsyncRead for ThreadedStdin {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if self.current_offset < self.current_chunk.len() {
+                let remaining = &self.current_chunk[self.current_offset..];
+                let count = remaining.len().min(buffer.remaining());
+                buffer.put_slice(&remaining[..count]);
+                self.current_offset += count;
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut self.chunk_receiver).poll_recv(context) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    self.current_chunk = chunk;
+                    self.current_offset = 0;
+                }
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 struct BoundedStdout {
-    chunk_sender: Option<std_mpsc::SyncSender<Vec<u8>>>,
+    chunk_sender: Option<std_mpsc::SyncSender<StdoutChunk>>,
     completion_receiver: oneshot::Receiver<io::Result<()>>,
     capacity_waker: Arc<Mutex<Option<Waker>>>,
+    flush_receivers: VecDeque<oneshot::Receiver<()>>,
+}
+
+fn read_stdin_chunks(sender: &mpsc::Sender<io::Result<Vec<u8>>>) {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    loop {
+        let mut chunk = vec![0_u8; STDIN_CHUNK_BYTES];
+        match reader.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(count) => chunk.truncate(count),
+            Err(error) => {
+                let _ = sender.blocking_send(Err(error));
+                return;
+            }
+        }
+        if sender.blocking_send(Ok(chunk)).is_err() {
+            return;
+        }
+    }
 }
 
 impl BoundedStdout {
@@ -523,25 +607,34 @@ impl BoundedStdout {
             chunk_sender: Some(chunk_sender),
             completion_receiver,
             capacity_waker,
+            flush_receivers: VecDeque::new(),
         })
     }
 }
 
 impl AsyncWrite for BoundedStdout {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let Some(sender) = self.chunk_sender.as_ref() else {
+        let Some(sender) = self.chunk_sender.clone() else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "the MCP standard-output writer is closed",
             )));
         };
         let count = buffer.len();
-        let chunk = match sender.try_send(buffer.to_vec()) {
-            Ok(()) => return Poll::Ready(Ok(count)),
+        let (flush_sender, flush_receiver) = oneshot::channel();
+        let chunk = StdoutChunk {
+            bytes: buffer.to_vec(),
+            flush_sender,
+        };
+        let chunk = match sender.try_send(chunk) {
+            Ok(()) => {
+                self.flush_receivers.push_back(flush_receiver);
+                return Poll::Ready(Ok(count));
+            }
             Err(std_mpsc::TrySendError::Full(chunk)) => chunk,
             Err(std_mpsc::TrySendError::Disconnected(_)) => {
                 return Poll::Ready(Err(io::Error::new(
@@ -560,7 +653,10 @@ impl AsyncWrite for BoundedStdout {
         }
 
         match sender.try_send(chunk) {
-            Ok(()) => Poll::Ready(Ok(count)),
+            Ok(()) => {
+                self.flush_receivers.push_back(flush_receiver);
+                Poll::Ready(Ok(count))
+            }
             Err(std_mpsc::TrySendError::Full(_)) => Poll::Pending,
             Err(std_mpsc::TrySendError::Disconnected(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -569,11 +665,30 @@ impl AsyncWrite for BoundedStdout {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(receiver) = self.flush_receivers.front_mut() {
+            match Pin::new(receiver).poll(context) {
+                Poll::Ready(Ok(())) => {
+                    self.flush_receivers.pop_front();
+                }
+                Poll::Ready(Err(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "the MCP standard-output thread stopped before flushing a response",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.as_mut().poll_flush(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         self.chunk_sender.take();
         match Pin::new(&mut self.completion_receiver).poll(context) {
             Poll::Ready(Ok(result)) => Poll::Ready(result),
@@ -587,18 +702,19 @@ impl AsyncWrite for BoundedStdout {
 }
 
 fn write_stdout_chunks(
-    receiver: std_mpsc::Receiver<Vec<u8>>,
+    receiver: std_mpsc::Receiver<StdoutChunk>,
     capacity_waker: &Mutex<Option<Waker>>,
 ) -> io::Result<()> {
     let stdout = io::stdout();
     let mut writer = stdout.lock();
     while let Ok(chunk) = receiver.recv() {
         wake_capacity_waiter(capacity_waker);
-        if let Err(error) = writer.write_all(&chunk).and_then(|()| writer.flush()) {
+        if let Err(error) = writer.write_all(&chunk.bytes).and_then(|()| writer.flush()) {
             drop(receiver);
             wake_capacity_waiter(capacity_waker);
             return Err(error);
         }
+        let _ = chunk.flush_sender.send(());
     }
     wake_capacity_waiter(capacity_waker);
     Ok(())

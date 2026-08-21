@@ -88,27 +88,32 @@ impl McpServer {
                 RpcError::invalid_request("JSON-RPC messages must be objects."),
             ));
         };
-        let id = request.get("id").cloned()?;
-        if RequestKey::from_value(&id).is_none() {
+        let id = request.get("id").cloned();
+        if id
+            .as_ref()
+            .is_some_and(|id| RequestKey::from_value(id).is_none())
+        {
             return Some(error_response(
                 Value::Null,
                 RpcError::invalid_request("JSON-RPC request IDs must be strings or numbers."),
             ));
         }
+        let response_id = id.clone().unwrap_or(Value::Null);
 
         if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             return Some(error_response(
-                id,
+                response_id,
                 RpcError::invalid_request("The jsonrpc field must be \"2.0\"."),
             ));
         }
         let Some(method) = request.get("method").and_then(Value::as_str) else {
             return Some(error_response(
-                id,
+                response_id,
                 RpcError::invalid_request("JSON-RPC requests require a method."),
             ));
         };
         let params = request.get("params");
+        let id = id?;
 
         Some(match self.handle_request(method, params).await {
             Ok(result) => success_response(id, result),
@@ -127,7 +132,10 @@ impl McpServer {
             "ping" => self.ping(params),
             "tools/list" => self.list_tools(params),
             "tools/call" => self.call_tool(params).await,
-            _ => Err(RpcError::method_not_found()),
+            _ => {
+                self.protocol_era(params)?;
+                Err(RpcError::method_not_found())
+            }
         }
     }
 
@@ -1078,7 +1086,7 @@ mod tests {
         params["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("1900-01-01");
 
         let response = mcp
-            .handle_message(request(1, "ping", params))
+            .handle_message(request(1, "unknown/method", params))
             .await
             .expect("an unsupported protocol version should return an error response");
 
@@ -1096,6 +1104,61 @@ mod tests {
                     }
                 }
             })
+        );
+
+        let response = mcp
+            .handle_message(request(2, "unknown/method", modern_params()))
+            .await
+            .expect("an unknown method should return an error response");
+
+        assert_eq!(
+            response,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found.",
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_idless_messages_but_ignores_valid_notifications() {
+        let server = ProjectServer::start(EMPTY_PROJECTS_RESPONSE).await;
+        let mut mcp = McpServer::new(client_for(&server));
+
+        for (message, expected_message) in [
+            (
+                json!({"jsonrpc": "2.0"}),
+                "JSON-RPC requests require a method.",
+            ),
+            (
+                json!({"jsonrpc": "1.0", "method": "ping"}),
+                "The jsonrpc field must be \"2.0\".",
+            ),
+            (
+                json!({"jsonrpc": "2.0", "method": 42}),
+                "JSON-RPC requests require a method.",
+            ),
+        ] {
+            let response = mcp
+                .handle_message(message)
+                .await
+                .expect("a malformed id-less message should return an error response");
+            assert_eq!(response["id"], Value::Null);
+            assert_eq!(response["error"]["code"], -32600);
+            assert_eq!(response["error"]["message"], expected_message);
+        }
+
+        assert_eq!(
+            mcp.handle_message(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }))
+            .await,
+            None
         );
     }
 
@@ -1470,6 +1533,69 @@ mod tests {
             .await
             .expect("the MCP test input should close cleanly");
 
+        wait_for_clean_shutdown(server_task).await;
+    }
+
+    #[tokio::test]
+    async fn reaps_completed_tool_calls_before_accepting_more_ready_input() {
+        let project_server = ProjectServer::start(EMPTY_PROJECTS_RESPONSE).await;
+        let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_stream);
+        let server_task = tokio::spawn(serve(
+            McpServer::new(client_for(&project_server)),
+            BufReader::new(server_reader),
+            server_writer,
+        ));
+        let (client_reader, mut client_writer) = tokio::io::split(client_stream);
+        let mut client_reader = BufReader::new(client_reader);
+        let mut call_params = modern_params();
+        call_params
+            .as_object_mut()
+            .expect("modern params should be an object")
+            .extend([
+                ("name".to_owned(), json!("unknown_tool")),
+                ("arguments".to_owned(), json!({})),
+            ]);
+
+        for id in 1..=MAX_IN_FLIGHT_REQUESTS {
+            write_test_message(
+                &mut client_writer,
+                &request(id as i64, "tools/call", call_params.clone()),
+            )
+            .await;
+        }
+        for _ in 0..1_024 {
+            write_test_message(
+                &mut client_writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                }),
+            )
+            .await;
+        }
+        let final_id = (MAX_IN_FLIGHT_REQUESTS + 1) as i64;
+        write_test_message(
+            &mut client_writer,
+            &request(final_id, "tools/call", call_params),
+        )
+        .await;
+
+        let mut final_response = None;
+        for _ in 0..=MAX_IN_FLIGHT_REQUESTS {
+            let response = read_test_response(&mut client_reader).await;
+            if response["id"] == final_id {
+                final_response = Some(response);
+            }
+        }
+        let final_response = final_response.expect("the final tool call should receive a response");
+        assert_eq!(final_response["error"]["code"], -32602);
+        assert_eq!(final_response["error"]["message"], "Unknown tool name.");
+
+        client_writer
+            .shutdown()
+            .await
+            .expect("the MCP test input should close cleanly");
         wait_for_clean_shutdown(server_task).await;
     }
 
