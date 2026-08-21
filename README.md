@@ -42,3 +42,20 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
 `Cargo.lock` is committed so local and automated builds resolve the same dependency versions.
+
+## Configuration
+
+The executable validates its Codecks configuration before server startup. Configuration errors are
+written to standard error and return a failing exit code; standard output remains reserved for MCP
+protocol traffic.
+
+| Environment variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `CODECKS_ACCOUNT` | Yes | - | Codecks account name or subdomain. |
+| `CODECKS_TOKEN` | Yes | - | Authentication token used for Codecks API requests. |
+| `CODECKS_TIMEOUT_SECONDS` | No | `30` | Positive integer request timeout in seconds. |
+| `CODECKS_LOG_LEVEL` | No | `info` | Diagnostic level: `error`, `warn`, `info`, `debug`, or `trace`. |
+
+Authentication tokens are redacted from standard debug and display output. Code that accesses the
+token for authentication must not log or include the exposed value in diagnostics. Tests can load
+configuration from supplied name-value pairs without setting real process credentials.
