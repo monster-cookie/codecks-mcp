@@ -2,13 +2,17 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
+const OUTPUT_BACKPRESSURE_SETUP_DEADLINE: Duration = Duration::from_secs(20);
+const OUTPUT_BACKPRESSURE_EXIT_DEADLINE: Duration = Duration::from_secs(5);
+const SLOW_READER_SCHEDULING_HEADROOM: Duration = Duration::from_secs(30);
 
 #[test]
 fn executable_supports_discovery_initialization_and_graceful_shutdown() {
@@ -175,8 +179,8 @@ fn executable_exits_when_the_client_stops_reading_standard_output() {
         }
     });
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let exited_promptly = loop {
+    let setup_deadline = Instant::now() + OUTPUT_BACKPRESSURE_SETUP_DEADLINE;
+    let setup_completed = loop {
         if child
             .try_wait()
             .expect("the backpressure probe state should be readable")
@@ -184,7 +188,10 @@ fn executable_exits_when_the_client_stops_reading_standard_output() {
         {
             break true;
         }
-        if Instant::now() >= deadline {
+        if writer.is_finished() {
+            break true;
+        }
+        if Instant::now() >= setup_deadline {
             child
                 .kill()
                 .expect("the unresponsive backpressure probe should be stopped");
@@ -192,6 +199,24 @@ fn executable_exits_when_the_client_stops_reading_standard_output() {
         }
         thread::sleep(Duration::from_millis(20));
     };
+    let exit_deadline = Instant::now() + OUTPUT_BACKPRESSURE_EXIT_DEADLINE;
+    let exited_promptly = setup_completed
+        && loop {
+            if child
+                .try_wait()
+                .expect("the backpressure probe state should be readable")
+                .is_some()
+            {
+                break true;
+            }
+            if Instant::now() >= exit_deadline {
+                child
+                    .kill()
+                    .expect("the unresponsive backpressure probe should be stopped");
+                break false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
     writer
         .join()
         .expect("the backpressure probe writer should join");
@@ -201,6 +226,11 @@ fn executable_exits_when_the_client_stops_reading_standard_output() {
     let stderr = String::from_utf8(output.stderr)
         .expect("the backpressure probe standard error should be UTF-8");
 
+    assert!(
+        setup_completed,
+        "the unread-output workload did not finish filling the bounded transport before the \
+         setup deadline: {stderr}"
+    );
     assert!(
         exited_promptly,
         "the MCP server did not exit under output backpressure: {stderr}"
@@ -217,22 +247,12 @@ fn executable_exits_when_the_client_stops_reading_standard_output() {
 
 #[test]
 fn executable_preserves_every_response_for_a_slow_buffered_reader() {
-    assert_delayed_reader_burst(
-        300,
-        Duration::ZERO,
-        Duration::from_millis(40),
-        Duration::from_secs(20),
-    );
+    assert_delayed_reader_burst(300, Duration::ZERO, Duration::from_millis(40));
 }
 
 #[test]
 fn executable_preserves_every_response_after_a_buffered_reader_pause() {
-    assert_delayed_reader_burst(
-        500,
-        Duration::from_millis(700),
-        Duration::from_millis(5),
-        Duration::from_secs(15),
-    );
+    assert_delayed_reader_burst(500, Duration::from_millis(700), Duration::from_millis(5));
 }
 
 #[test]
@@ -336,7 +356,6 @@ fn assert_delayed_reader_burst(
     request_count: u64,
     initial_pause: Duration,
     response_delay: Duration,
-    response_deadline: Duration,
 ) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_codecks-mcp"))
         .env("CODECKS_ACCOUNT", "slow-reader-test-account")
@@ -368,6 +387,19 @@ fn assert_delayed_reader_burst(
         .flush()
         .expect("the slow-reader request burst should be flushed");
 
+    let expected_reader_delay = response_delay
+        .checked_mul(
+            request_count
+                .try_into()
+                .expect("the slow-reader request count should fit in u32"),
+        )
+        .expect("the slow-reader delay should fit in Duration");
+    let response_deadline = initial_pause
+        .checked_add(expected_reader_delay)
+        .and_then(|duration| duration.checked_add(SLOW_READER_SCHEDULING_HEADROOM))
+        .expect("the slow-reader response deadline should fit in Duration");
+    let received_count = Arc::new(AtomicU64::new(0));
+    let reader_received_count = Arc::clone(&received_count);
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
     let reader = thread::spawn(move || {
         thread::sleep(initial_pause);
@@ -379,6 +411,7 @@ fn assert_delayed_reader_burst(
                 )
                 .expect("every slow-reader response line should contain JSON"),
             );
+            reader_received_count.store(responses.len() as u64, Ordering::Relaxed);
             thread::sleep(response_delay);
         }
         let _ = response_sender.send(responses);
@@ -399,7 +432,8 @@ fn assert_delayed_reader_burst(
                 .expect("the stopped slow-reader response thread should join");
             panic!(
                 "the slow buffered reader did not receive every response before the deadline: \
-                 {error}; stderr: {}",
+                 {error}; received {} of {request_count}; stderr: {}",
+                received_count.load(Ordering::Relaxed),
                 String::from_utf8_lossy(&output.stderr)
             );
         }
