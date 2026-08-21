@@ -65,6 +65,7 @@ where
         mpsc::channel::<CompletedRequest>(MAX_IN_FLIGHT_REQUESTS);
     let mut in_flight = HashMap::<RequestKey, InFlightRequest>::new();
     let mut next_task_token = 0_u64;
+    let mut input_closed = false;
 
     let loop_result = loop {
         tokio::select! {
@@ -82,6 +83,7 @@ where
                             &mut input_receiver,
                             &mut deferred_inputs,
                             &mut in_flight,
+                            &mut input_closed,
                             &mut reader_task,
                         )
                         .await
@@ -95,6 +97,9 @@ where
             }
             input = receive_input(&mut deferred_inputs, &mut input_receiver) => {
                 let Some(input) = input else {
+                    if input_closed {
+                        break Ok(());
+                    }
                     break flatten_task_result((&mut reader_task).await);
                 };
                 match input.into_frame() {
@@ -108,6 +113,7 @@ where
                                     &mut input_receiver,
                                     &mut deferred_inputs,
                                     &mut in_flight,
+                                    &mut input_closed,
                                     &mut reader_task,
                                 )
                                 .await
@@ -138,6 +144,7 @@ where
                                     &mut input_receiver,
                                     &mut deferred_inputs,
                                     &mut in_flight,
+                                    &mut input_closed,
                                     &mut reader_task,
                                 )
                                 .await
@@ -175,6 +182,7 @@ where
                                 &mut input_receiver,
                                 &mut deferred_inputs,
                                 &mut in_flight,
+                                &mut input_closed,
                                 &mut reader_task,
                             )
                             .await
@@ -197,6 +205,7 @@ where
                             &mut input_receiver,
                             &mut deferred_inputs,
                             &mut in_flight,
+                            &mut input_closed,
                             &mut reader_task,
                         )
                         .await
@@ -208,9 +217,6 @@ where
                     }
                     FrameRead::EndOfFile => unreachable!("EOF is reported by the reader task"),
                 }
-            }
-            reader_result = &mut reader_task => {
-                break flatten_task_result(reader_result);
             }
             writer_result = &mut writer_task => {
                 reader_task.abort();
@@ -258,8 +264,16 @@ async fn queue_response(
     input_receiver: &mut mpsc::Receiver<InputEvent>,
     deferred_inputs: &mut VecDeque<InputEvent>,
     in_flight: &mut HashMap<RequestKey, InFlightRequest>,
+    input_closed: &mut bool,
     reader_task: &mut JoinHandle<io::Result<()>>,
 ) -> io::Result<QueueOutcome> {
+    if *input_closed {
+        return match timeout(WRITER_SHUTDOWN_GRACE, sender.send(response)).await {
+            Ok(result) => map_response_queue_result(result),
+            Err(_) => Ok(QueueOutcome::Stop),
+        };
+    }
+
     let send = sender.send(response);
     tokio::pin!(send);
 
@@ -267,21 +281,16 @@ async fn queue_response(
         tokio::select! {
             biased;
             result = &mut send => {
-                return result
-                    .map(|()| QueueOutcome::Queued)
-                    .map_err(|_| io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "the MCP standard-output writer stopped",
-                    ));
-            }
-            reader_result = &mut *reader_task => {
-                flatten_task_result(reader_result)?;
-                return Ok(QueueOutcome::Stop);
+                return map_response_queue_result(result);
             }
             input = input_receiver.recv() => {
                 let Some(input) = input else {
                     flatten_task_result((&mut *reader_task).await)?;
-                    return Ok(QueueOutcome::Stop);
+                    *input_closed = true;
+                    return match timeout(WRITER_SHUTDOWN_GRACE, &mut send).await {
+                        Ok(result) => map_response_queue_result(result),
+                        Err(_) => Ok(QueueOutcome::Stop),
+                    };
                 };
                 if let Some(key) = input.cancelled_request_key() {
                     if let Some(request) = in_flight.remove(&key) {
@@ -297,6 +306,17 @@ async fn queue_response(
             }
         }
     }
+}
+
+fn map_response_queue_result(
+    result: Result<(), mpsc::error::SendError<Value>>,
+) -> io::Result<QueueOutcome> {
+    result.map(|()| QueueOutcome::Queued).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the MCP standard-output writer stopped",
+        )
+    })
 }
 
 fn flatten_task_result(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {

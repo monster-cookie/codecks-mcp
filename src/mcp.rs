@@ -1537,6 +1537,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_of_file_drains_accepted_responses_when_a_blocked_writer_resumes() {
+        let project_server = ProjectServer::start(EMPTY_PROJECTS_RESPONSE).await;
+        let (client_input, server_input) = tokio::io::duplex(256 * 1024);
+        let (server_reader, _) = tokio::io::split(server_input);
+        let (_, mut client_writer) = tokio::io::split(client_input);
+        let (server_output, client_output) = tokio::io::duplex(64);
+        let mut client_reader = BufReader::new(client_output);
+        let server_task = tokio::spawn(serve(
+            McpServer::new(client_for(&project_server)),
+            BufReader::new(server_reader),
+            server_output,
+        ));
+        let request_count = (RESPONSE_QUEUE_CAPACITY * 2 + 2) as i64;
+
+        for id in 1..=request_count {
+            write_test_message(&mut client_writer, &request(id, "ping", modern_params())).await;
+        }
+        client_writer
+            .shutdown()
+            .await
+            .expect("the MCP test input should close cleanly");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        for expected_id in 1..=request_count {
+            assert_eq!(
+                read_test_response(&mut client_reader).await["id"],
+                expected_id,
+                "EOF should preserve every response accepted before output resumes"
+            );
+        }
+        wait_for_clean_shutdown(server_task).await;
+    }
+
+    #[tokio::test]
     async fn reaps_completed_tool_calls_before_accepting_more_ready_input() {
         let project_server = ProjectServer::start(EMPTY_PROJECTS_RESPONSE).await;
         let (client_stream, server_stream) = tokio::io::duplex(256 * 1024);
