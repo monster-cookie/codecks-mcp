@@ -1,4 +1,281 @@
 //! Codecks API integration.
 //!
-//! This module will isolate Codecks authentication, requests, and responses from MCP protocol
-//! handling.
+//! This module isolates Codecks authentication, requests, and responses from MCP protocol handling.
+
+use std::fmt;
+use std::time::Duration;
+
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Client, StatusCode, Url};
+use serde_json::Value;
+
+use crate::config::Config;
+use crate::error::ApplicationError;
+
+/// The fixed public endpoint used for Codecks API requests.
+pub const CODECKS_API_ENDPOINT: &str = "https://api.codecks.io/";
+
+const ACCOUNT_HEADER: HeaderName = HeaderName::from_static("x-account");
+const AUTHENTICATION_HEADER: HeaderName = HeaderName::from_static("x-auth-token");
+
+/// An asynchronous, credential-safe client for the Codecks JSON API.
+///
+/// The default constructor always targets [`CODECKS_API_ENDPOINT`]. Request headers are prepared
+/// once and omitted from the client's debug representation so credentials cannot be exposed by
+/// routine diagnostics.
+#[derive(Clone)]
+pub struct CodecksClient {
+    http_client: Client,
+    endpoint: Url,
+    request_headers: HeaderMap,
+    request_timeout: Duration,
+}
+
+impl CodecksClient {
+    /// Builds a client from validated runtime configuration using the fixed Codecks API endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplicationError::InvalidIdentifier`] when the account cannot be represented as
+    /// an HTTP header, or [`ApplicationError::AuthenticationFailed`] when the authentication token
+    /// cannot be represented safely as an HTTP header.
+    pub fn new(config: &Config) -> Result<Self, ApplicationError> {
+        let endpoint =
+            Url::parse(CODECKS_API_ENDPOINT).map_err(|_| ApplicationError::InvalidIdentifier)?;
+        Self::build(config, endpoint)
+    }
+
+    #[cfg(test)]
+    fn with_endpoint(config: &Config, endpoint: &str) -> Result<Self, ApplicationError> {
+        let endpoint = Url::parse(endpoint).map_err(|_| ApplicationError::InvalidIdentifier)?;
+        Self::build(config, endpoint)
+    }
+
+    fn build(config: &Config, endpoint: Url) -> Result<Self, ApplicationError> {
+        let account = HeaderValue::from_str(config.account())
+            .map_err(|_| ApplicationError::InvalidIdentifier)?;
+        let authentication = HeaderValue::from_str(config.authentication_token().expose())
+            .map_err(|_| ApplicationError::AuthenticationFailed)?;
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(ACCOUNT_HEADER, account);
+        request_headers.insert(AUTHENTICATION_HEADER, authentication);
+
+        let request_timeout = config.request_timeout();
+        let http_client = Client::builder()
+            .connect_timeout(request_timeout)
+            .timeout(request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ApplicationError::NetworkFailure)?;
+
+        Ok(Self {
+            http_client,
+            endpoint,
+            request_headers,
+            request_timeout,
+        })
+    }
+
+    /// Sends a JSON request to Codecks and returns its decoded JSON response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`ApplicationError`] for authentication, authorization, timeout, network,
+    /// API-status, and invalid-response failures. No response body or upstream error text is
+    /// retained in the returned error.
+    pub async fn request(&self, request: &Value) -> Result<Value, ApplicationError> {
+        let response = self
+            .http_client
+            .post(self.endpoint.clone())
+            .headers(self.request_headers.clone())
+            .json(request)
+            .send()
+            .await
+            .map_err(map_request_error)?;
+
+        map_status(response.status())?;
+
+        response.json().await.map_err(map_response_error)
+    }
+}
+
+impl fmt::Debug for CodecksClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodecksClient")
+            .field("endpoint", &self.endpoint.as_str())
+            .field("request_headers", &"[REDACTED]")
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
+}
+
+fn map_status(status: StatusCode) -> Result<(), ApplicationError> {
+    match status {
+        StatusCode::UNAUTHORIZED => Err(ApplicationError::AuthenticationFailed),
+        StatusCode::FORBIDDEN => Err(ApplicationError::AuthorizationFailed),
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => Err(ApplicationError::Timeout),
+        status if status.is_success() => Ok(()),
+        _ => Err(ApplicationError::CodecksApiError),
+    }
+}
+
+fn map_request_error(error: reqwest::Error) -> ApplicationError {
+    if error.is_timeout() {
+        ApplicationError::Timeout
+    } else {
+        ApplicationError::NetworkFailure
+    }
+}
+
+fn map_response_error(error: reqwest::Error) -> ApplicationError {
+    if error.is_timeout() {
+        ApplicationError::Timeout
+    } else if error.is_decode() {
+        ApplicationError::InvalidCodecksResponse
+    } else {
+        ApplicationError::NetworkFailure
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::time::timeout;
+
+    use super::support::{DisconnectingServer, MockResponse, MockServer};
+    use super::*;
+
+    const TEST_ACCOUNT: &str = "client-test-account";
+    const TEST_TOKEN: &str = "client-secret-sentinel";
+
+    fn config(timeout_seconds: &str) -> Config {
+        Config::from_values([
+            ("CODECKS_ACCOUNT", TEST_ACCOUNT),
+            ("CODECKS_TOKEN", TEST_TOKEN),
+            ("CODECKS_TIMEOUT_SECONDS", timeout_seconds),
+        ])
+        .expect("the client test configuration should be valid")
+    }
+
+    #[tokio::test]
+    async fn sends_authenticated_json_and_decodes_successful_response() {
+        let mut server =
+            MockServer::start(MockResponse::json(200, r#"{"result":{"ok":true}}"#)).await;
+        let client = CodecksClient::with_endpoint(&config("30"), server.endpoint())
+            .expect("the test client should build");
+
+        let response = client
+            .request(&json!({"queries": [{"_root": ["account", "projects"]}]}))
+            .await
+            .expect("a valid response should decode");
+        let request = String::from_utf8(server.received_request().await)
+            .expect("the captured request should be UTF-8");
+        let normalized_request = request.to_ascii_lowercase();
+
+        assert_eq!(response, json!({"result": {"ok": true}}));
+        assert!(normalized_request.starts_with("post / http/1.1\r\n"));
+        assert!(normalized_request.contains("x-account: client-test-account\r\n"));
+        assert!(normalized_request.contains("x-auth-token: client-secret-sentinel\r\n"));
+        assert!(request.contains(r#""queries"#));
+    }
+
+    #[tokio::test]
+    async fn maps_authentication_and_authorization_statuses() {
+        for (status, expected_error) in [
+            (401, ApplicationError::AuthenticationFailed),
+            (403, ApplicationError::AuthorizationFailed),
+        ] {
+            let server =
+                MockServer::start(MockResponse::json(status, r#"{"error":"ignored"}"#)).await;
+            let client = CodecksClient::with_endpoint(&config("30"), server.endpoint())
+                .expect("the test client should build");
+
+            let error = client
+                .request(&json!({"queries": []}))
+                .await
+                .expect_err("the HTTP status should map to a typed error");
+
+            assert_eq!(error, expected_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_network_and_timeout_failures() {
+        let disconnecting_server = DisconnectingServer::start().await;
+        let network_client =
+            CodecksClient::with_endpoint(&config("30"), disconnecting_server.endpoint())
+                .expect("the network-failure client should build");
+        let network_error = network_client
+            .request(&json!({"queries": []}))
+            .await
+            .expect_err("a disconnected request should fail");
+
+        assert_eq!(network_error, ApplicationError::NetworkFailure);
+
+        let server = MockServer::start(
+            MockResponse::json(200, r#"{"result":{}}"#).delayed(Duration::from_secs(2)),
+        )
+        .await;
+        let timeout_client = CodecksClient::with_endpoint(&config("1"), server.endpoint())
+            .expect("the timeout client should build");
+        let timeout_error = timeout_client
+            .request(&json!({"queries": []}))
+            .await
+            .expect_err("a delayed response should time out");
+
+        assert_eq!(timeout_error, ApplicationError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_json_without_retaining_the_response_body() {
+        const INVALID_RESPONSE_SENTINEL: &str = "invalid-response-secret-sentinel";
+
+        let server = MockServer::start(MockResponse::json(200, INVALID_RESPONSE_SENTINEL)).await;
+        let client = CodecksClient::with_endpoint(&config("30"), server.endpoint())
+            .expect("the test client should build");
+        let error = client
+            .request(&json!({"queries": []}))
+            .await
+            .expect_err("invalid JSON should fail safely");
+        let diagnostics = format!("{error:?}\n{error}");
+
+        assert_eq!(error, ApplicationError::InvalidCodecksResponse);
+        assert!(!diagnostics.contains(INVALID_RESPONSE_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_without_contacting_or_authenticating_the_target() {
+        let mut redirect_target =
+            MockServer::start(MockResponse::json(200, r#"{"result":{}}"#)).await;
+        let mut redirecting_server =
+            MockServer::start(MockResponse::redirect(redirect_target.endpoint())).await;
+        let client = CodecksClient::with_endpoint(&config("30"), redirecting_server.endpoint())
+            .expect("the redirect test client should build");
+
+        let error = client
+            .request(&json!({"queries": []}))
+            .await
+            .expect_err("a redirect should remain an API status failure");
+        let initial_request = String::from_utf8(redirecting_server.received_request().await)
+            .expect("the initial request should be UTF-8");
+
+        assert_eq!(error, ApplicationError::CodecksApiError);
+        assert!(initial_request.contains(TEST_TOKEN));
+        assert!(
+            timeout(
+                Duration::from_millis(150),
+                redirect_target.received_request()
+            )
+            .await
+            .is_err(),
+            "the redirect target unexpectedly received a request"
+        );
+    }
+}

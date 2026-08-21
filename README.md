@@ -3,8 +3,9 @@
 An independent Model Context Protocol (MCP) server for the Codecks API.
 
 > [!NOTE]
-> The repository currently contains the Rust workspace, validated runtime configuration, and core
-> error model. It does not yet implement the MCP protocol or communicate with Codecks.
+> The repository currently contains the Rust workspace, validated runtime configuration, core
+> error model, and asynchronous Codecks HTTP client. It does not yet implement the MCP protocol or
+> expose Codecks operations.
 
 ## Development
 
@@ -25,7 +26,7 @@ components automatically through Rustup.
 - `src/main.rs` is the executable entry point.
 - `src/lib.rs` exposes the library's architectural boundaries.
 - `src/mcp.rs` defines MCP-facing representations and is reserved for transport integration.
-- `src/codecks_api.rs` is reserved for Codecks API integration.
+- `src/codecks_api.rs` provides authenticated, timeout-bounded Codecks API transport.
 - `src/config.rs` is reserved for configuration loading and validation.
 - `src/domain.rs` is reserved for domain models shared across integrations.
 - `src/error.rs` defines application error types shared by the API and MCP layers.
@@ -66,3 +67,12 @@ protocol traffic.
 Authentication tokens are redacted from standard debug and display output. Code that accesses the
 token for authentication must not log or include the exposed value in diagnostics. Tests can load
 configuration from supplied name-value pairs without setting real process credentials.
+
+## Codecks HTTP transport
+
+Production requests are sent as JSON `POST` requests to `https://api.codecks.io/` with the account
+and authentication token supplied through the Codecks authentication headers. Both connection and
+request duration are bounded by `CODECKS_TIMEOUT_SECONDS`. HTTP status, timeout, network, and JSON
+decoding failures map to credential-safe application errors; response bodies and upstream error
+details are not retained in diagnostics. Redirects are rejected so authentication headers cannot
+leave the fixed Codecks endpoint.
