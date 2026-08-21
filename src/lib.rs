@@ -8,3 +8,4 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod mcp;
+pub mod project_resolver;

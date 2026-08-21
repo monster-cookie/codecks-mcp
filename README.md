@@ -4,8 +4,9 @@ An independent Model Context Protocol (MCP) server for the Codecks API.
 
 > [!NOTE]
 > The repository currently contains the Rust workspace, validated runtime configuration, core
-> error model, asynchronous Codecks HTTP client, and paginated project discovery. It does not yet
-> implement the MCP protocol or expose project discovery as an MCP operation.
+> error model, asynchronous Codecks HTTP client, paginated project discovery, and deterministic
+> project resolution. It does not yet implement the MCP protocol or expose project discovery as an
+> MCP operation.
 
 ## Development
 
@@ -31,6 +32,7 @@ components automatically through Rustup.
 - `src/config.rs` is reserved for configuration loading and validation.
 - `src/domain.rs` defines project models shared across integrations.
 - `src/error.rs` defines application error types shared by the API and MCP layers.
+- `src/project_resolver.rs` resolves explicit or implicit project selections for shared callers.
 
 ### Error model
 
@@ -85,3 +87,7 @@ It requests projects in stable, ordered pages and continues until Codecks return
 Each result preserves the stable project UUID and the exact current display name returned by the
 API. Mock transport coverage verifies empty, single-project, and multi-page responses without using
 live Codecks credentials.
+
+`resolve_project` selects explicit project UUIDs before exact display names. When no selector is
+provided, it automatically selects the project only when exactly one is available; empty and
+ambiguous selections return the stable `project_not_found` and `project_ambiguous` errors.
