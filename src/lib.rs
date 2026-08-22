@@ -1,7 +1,8 @@
-//! Core library boundaries for the Codecks MCP server.
+//! Reusable configuration, Codecks API, project resolution, and MCP server behavior.
 //!
-//! The modules are intentionally minimal while the workspace is bootstrapped. Protocol and API
-//! behavior will be added by focused follow-up work.
+//! The crate exposes credential-safe application boundaries plus the bounded stdio JSON-RPC server
+//! used by the `codecks-mcp` executable. MCP discovery currently publishes read-only project
+//! listing and deterministic project retrieval tools.
 
 pub mod codecks_api;
 pub mod config;

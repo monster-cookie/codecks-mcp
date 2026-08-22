@@ -2,11 +2,8 @@
 
 An independent Model Context Protocol (MCP) server for the Codecks API.
 
-> [!NOTE]
-> The repository currently contains the Rust workspace, validated runtime configuration, core
-> error model, asynchronous Codecks HTTP client, paginated project discovery, and deterministic
-> project resolution. It does not yet implement the MCP protocol or expose project discovery as an
-> MCP operation.
+The repository provides a native Rust MCP server that connects Codex and other MCP clients to the
+Codecks API over standard input and standard output.
 
 ## Development
 
@@ -26,7 +23,8 @@ components automatically through Rustup.
 
 - `src/main.rs` is the executable entry point.
 - `src/lib.rs` exposes the library's architectural boundaries.
-- `src/mcp.rs` defines MCP-facing representations and is reserved for transport integration.
+- `src/mcp.rs` implements MCP discovery, legacy initialization, and tool handling.
+- `src/mcp/stdio.rs` implements bounded stdio transport and process lifecycle behavior.
 - `src/codecks_api.rs` provides authenticated, timeout-bounded Codecks API transport and project
   enumeration.
 - `src/config.rs` is reserved for configuration loading and validation.
@@ -91,3 +89,36 @@ live Codecks credentials.
 `resolve_project` selects explicit project UUIDs before exact display names. When no selector is
 provided, it automatically selects the project only when exactly one is available; empty and
 ambiguous selections return the stable `project_not_found` and `project_ambiguous` errors.
+
+## MCP server
+
+Run `codecks-mcp` with the required configuration in its process environment and configure the MCP
+client to communicate with the executable over stdio. The server implements current
+`2026-07-28` `server/discover` negotiation and legacy `initialize` negotiation for compatible MCP
+clients. It emits only newline-delimited JSON-RPC messages on standard output, reports startup and
+transport diagnostics on standard error, and limits each input frame to one mebibyte. At most 32
+tool calls run concurrently, and queued responses use bounded buffers. Transient output pressure
+applies asynchronous backpressure without a fixed response deadline, so a client that continues
+reading receives every response even when its buffered processing is slow. Input backlog is bounded
+by both message count and retained bytes; a client that continues sending while output is genuinely
+blocked receives an explicit transport failure instead of causing memory growth. Tool calls can
+complete out of order;
+`notifications/cancelled` stops matching in-flight work without sending a response. Closing
+standard input cancels outstanding requests and time-bounds response draining so a blocked output
+stream cannot prevent process exit.
+
+JSON-RPC request IDs must be strings or numbers. Requests containing `null`, object, array, or
+Boolean IDs are rejected as invalid requests before method dispatch and never reach Codecks.
+
+Tool discovery exposes exactly two read-only operations in stable order:
+
+- `list_projects` lists every active project available to the authenticated Codecks account.
+- `get_project` accepts an optional `project` UUID or exact display name. Without a selector it
+  succeeds only when the account has exactly one project.
+
+Current-protocol tool discovery marks this static, account-independent catalog as publicly
+cacheable for one hour. Legacy tool discovery omits current-only cache metadata while retaining
+root-object output schemas required by legacy clients.
+
+Both tools return matching JSON text and structured content. Codecks and resolution failures use
+the stable credential-safe application error codes and set the MCP tool result's `isError` flag.

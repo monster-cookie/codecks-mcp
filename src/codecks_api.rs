@@ -49,7 +49,7 @@ impl CodecksClient {
     }
 
     #[cfg(test)]
-    fn with_endpoint(config: &Config, endpoint: &str) -> Result<Self, ApplicationError> {
+    pub(crate) fn with_endpoint(config: &Config, endpoint: &str) -> Result<Self, ApplicationError> {
         let endpoint = Url::parse(endpoint).map_err(|_| ApplicationError::InvalidIdentifier)?;
         Self::build(config, endpoint)
     }
